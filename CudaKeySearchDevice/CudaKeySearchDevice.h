@@ -43,6 +43,12 @@ private:
 
     uint64_t _iterations;
 
+    // Profiling infrastructure
+    cudaEvent_t _startEvent;
+    cudaEvent_t _stopEvent;
+    double _totalKernelTime;
+    uint64_t _kernelInvocations;
+
     void cudaCall(cudaError_t err);
 
     void generateStartingPoints();
@@ -66,6 +72,8 @@ private:
     secp256k1::uint256 _stride;
 
     bool verifyKey(const secp256k1::uint256 &privateKey, const secp256k1::ecpoint &publicKey, const unsigned int hash[5], bool compressed);
+
+    void calculateAndLogOccupancy();
 
 public:
 

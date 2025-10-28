@@ -47,39 +47,54 @@ __constant__ static unsigned int _LAMBDA[8] = {
 };
 
 
+/**
+ * Phase 4 Optimization: Unrolled isInfinity check with early exit
+ */
 __device__ __forceinline__ bool isInfinity(const unsigned int x[8])
 {
-	bool isf = true;
-
-	for(int i = 0; i < 8; i++) {
-		if(x[i] != 0xffffffff) {
-			isf = false;
-		}
-	}
-
-	return isf;
+	// Fully unrolled with early exit for better performance
+	return (x[0] == 0xffffffff) && (x[1] == 0xffffffff) &&
+	       (x[2] == 0xffffffff) && (x[3] == 0xffffffff) &&
+	       (x[4] == 0xffffffff) && (x[5] == 0xffffffff) &&
+	       (x[6] == 0xffffffff) && (x[7] == 0xffffffff);
 }
 
+/**
+ * Phase 4 Optimization: Unrolled copyBigInt for better instruction-level parallelism
+ */
 __device__ __forceinline__ static void copyBigInt(const unsigned int src[8], unsigned int dest[8])
 {
-	for(int i = 0; i < 8; i++) {
-		dest[i] = src[i];
-	}
+	// Fully unrolled - allows compiler to schedule loads/stores optimally
+	dest[0] = src[0];
+	dest[1] = src[1];
+	dest[2] = src[2];
+	dest[3] = src[3];
+	dest[4] = src[4];
+	dest[5] = src[5];
+	dest[6] = src[6];
+	dest[7] = src[7];
 }
 
+/**
+ * Phase 4 Optimization: Unrolled equality check with early exit
+ */
 __device__ static bool equal(const unsigned int *a, const unsigned int *b)
 {
-	bool eq = true;
-
-	for(int i = 0; i < 8; i++) {
-		eq &= (a[i] == b[i]);
-	}
-
-	return eq;
+	// Fully unrolled with short-circuit evaluation for better performance
+	return (a[0] == b[0]) && (a[1] == b[1]) && (a[2] == b[2]) && (a[3] == b[3]) &&
+	       (a[4] == b[4]) && (a[5] == b[5]) && (a[6] == b[6]) && (a[7] == b[7]);
 }
 
 /**
  * Reads an 8-word big integer from device memory
+ *
+ * Phase 4 Note: Memory Layout
+ * This uses strided access pattern where consecutive threads access consecutive memory.
+ * For array index 'idx', the layout is: [word0_thread0, word0_thread1, ..., word0_threadN,
+ * word1_thread0, word1_thread1, ..., word1_threadN, ..., word7_threadN]
+ *
+ * This provides coalesced memory access within each word load (good L1/L2 hit rate).
+ * Alternative layout (interleaved per thread) would require 8 scattered loads.
  */
 __device__ static void readInt(const unsigned int *ara, int idx, unsigned int x[8])
 {
@@ -91,10 +106,15 @@ __device__ static void readInt(const unsigned int *ara, int idx, unsigned int x[
 
 	int index = base + threadId;
 
-	for (int i = 0; i < 8; i++) {
-		x[i] = ara[index];
-		index += totalThreads;
-	}
+	// Phase 4: Unrolled for better instruction scheduling
+	x[0] = ara[index]; index += totalThreads;
+	x[1] = ara[index]; index += totalThreads;
+	x[2] = ara[index]; index += totalThreads;
+	x[3] = ara[index]; index += totalThreads;
+	x[4] = ara[index]; index += totalThreads;
+	x[5] = ara[index]; index += totalThreads;
+	x[6] = ara[index]; index += totalThreads;
+	x[7] = ara[index];
 }
 
 __device__ static unsigned int readIntLSW(const unsigned int *ara, int idx)
@@ -112,6 +132,8 @@ __device__ static unsigned int readIntLSW(const unsigned int *ara, int idx)
 
 /**
  * Writes an 8-word big integer to device memory
+ *
+ * Phase 4 Note: Same strided memory pattern as readInt for coalesced writes
  */
 __device__ static void writeInt(unsigned int *ara, int idx, const unsigned int x[8])
 {
@@ -123,10 +145,15 @@ __device__ static void writeInt(unsigned int *ara, int idx, const unsigned int x
 
 	int index = base + threadId;
 
-	for (int i = 0; i < 8; i++) {
-		ara[index] = x[i];
-		index += totalThreads;
-	}
+	// Phase 4: Unrolled for better instruction scheduling
+	ara[index] = x[0]; index += totalThreads;
+	ara[index] = x[1]; index += totalThreads;
+	ara[index] = x[2]; index += totalThreads;
+	ara[index] = x[3]; index += totalThreads;
+	ara[index] = x[4]; index += totalThreads;
+	ara[index] = x[5]; index += totalThreads;
+	ara[index] = x[6]; index += totalThreads;
+	ara[index] = x[7];
 }
 
 /**

@@ -30,19 +30,33 @@ __constant__ unsigned int _IV[8] = {
 };
 
 
+// Phase 3 Optimization: Use PTX funnel shift for rotations (much faster)
 __device__ __forceinline__ unsigned int rotr(unsigned int x, int n)
 {
-	return (x >> n) ^ (x << (32 - n));
+#ifdef USE_FAST_MATH_PTX
+	return rotr_ptx(x, n);  // Single PTX instruction
+#else
+	return (x >> n) | (x << (32 - n));  // Fixed: was using XOR, should be OR
+#endif
 }
 
+// Phase 3 Optimization: Use LOP3 instruction for 3-input boolean operations
 __device__ __forceinline__ unsigned int MAJ(unsigned int a, unsigned int b, unsigned int c)
 {
+#ifdef USE_FAST_MATH_PTX
+	return lop3_maj(a, b, c);  // Single PTX instruction (Turing+)
+#else
 	return (a & b) ^ (a & c) ^ (b & c);
+#endif
 }
 
 __device__ __forceinline__ unsigned int CH(unsigned int e, unsigned int f, unsigned int g)
 {
+#ifdef USE_FAST_MATH_PTX
+	return lop3_ch(e, f, g);  // Single PTX instruction (Turing+)
+#else
 	return (e & f) ^ (~e & g);
+#endif
 }
 
 __device__ __forceinline__ unsigned int s0(unsigned int x)

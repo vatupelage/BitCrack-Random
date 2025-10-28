@@ -25,11 +25,17 @@ __constant__ unsigned int _K6 = 0x5c4dd124;
 __constant__ unsigned int _K7 = 0x50a28be6;
 
 
+// Phase 3 Optimization: Use PTX funnel shift for rotations
 __device__ __forceinline__ unsigned int rotl(unsigned int x, int n)
 {
+#ifdef USE_FAST_MATH_PTX
+	return rotl_ptx(x, n);  // Single PTX instruction
+#else
 	return (x << n) | (x >> (32 - n));
+#endif
 }
 
+// Phase 3 Optimization: Use LOP3 for 3-input boolean operations where applicable
 __device__ __forceinline__ unsigned int F(unsigned int x, unsigned int y, unsigned int z)
 {
 	return x ^ y ^ z;
@@ -37,7 +43,11 @@ __device__ __forceinline__ unsigned int F(unsigned int x, unsigned int y, unsign
 
 __device__ __forceinline__ unsigned int G(unsigned int x, unsigned int y, unsigned int z)
 {
+#ifdef USE_FAST_MATH_PTX
+	return lop3_ch(x, y, z);  // Same as CH(x,y,z) = (x&y)|(~x&z)
+#else
 	return (((x) & (y)) | (~(x) & (z)));
+#endif
 }
 
 __device__ __forceinline__ unsigned int H(unsigned int x, unsigned int y, unsigned int z)
@@ -47,7 +57,12 @@ __device__ __forceinline__ unsigned int H(unsigned int x, unsigned int y, unsign
 
 __device__ __forceinline__ unsigned int I(unsigned int x, unsigned int y, unsigned int z)
 {
+#ifdef USE_FAST_MATH_PTX
+	// I(x,y,z) = (x&z)|(y&~z) = CH(z,x,y)
+	return lop3_ch(z, x, y);
+#else
 	return (((x) & (z)) | ((y) & ~(z)));
+#endif
 }
 
 __device__ __forceinline__ unsigned int J(unsigned int x, unsigned int y, unsigned int z)

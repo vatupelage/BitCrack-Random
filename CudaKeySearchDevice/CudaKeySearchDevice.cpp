@@ -56,6 +56,12 @@ CudaKeySearchDevice::CudaKeySearchDevice(int device, int threads, int pointsPerT
     _device = device;
 
     _pointsPerThread = pointsPerThread;
+
+    // Initialize profiling infrastructure
+    _totalKernelTime = 0.0;
+    _kernelInvocations = 0;
+    _startEvent = nullptr;
+    _stopEvent = nullptr;
 }
 
 void CudaKeySearchDevice::init(const secp256k1::uint256 &start, int compression, const secp256k1::uint256 &stride)
@@ -77,6 +83,13 @@ void CudaKeySearchDevice::init(const secp256k1::uint256 &start, int compression,
 
     // Use a larger portion of shared memory for L1 cache
     cudaCall(cudaDeviceSetCacheConfig(cudaFuncCachePreferL1));
+
+    // Create CUDA events for profiling
+    cudaCall(cudaEventCreate(&_startEvent));
+    cudaCall(cudaEventCreate(&_stopEvent));
+
+    // Calculate and log occupancy for performance diagnostics
+    calculateAndLogOccupancy();
 
     generateStartingPoints();
 
@@ -146,6 +159,9 @@ void CudaKeySearchDevice::doStep()
 {
     uint64_t numKeys = (uint64_t)_blocks * _threads * _pointsPerThread;
 
+    // Record kernel start time
+    cudaCall(cudaEventRecord(_startEvent, 0));
+
     try {
         if(_iterations < 2 && _startExponent.cmp(numKeys) <= 0) {
             callKeyFinderKernel(_blocks, _threads, _pointsPerThread, true, _compression);
@@ -154,6 +170,25 @@ void CudaKeySearchDevice::doStep()
         }
     } catch(cuda::CudaException ex) {
         throw KeySearchException(ex.msg);
+    }
+
+    // Record kernel end time
+    cudaCall(cudaEventRecord(_stopEvent, 0));
+    cudaCall(cudaEventSynchronize(_stopEvent));
+
+    // Calculate elapsed time
+    float milliseconds = 0;
+    cudaCall(cudaEventElapsedTime(&milliseconds, _startEvent, _stopEvent));
+    _totalKernelTime += milliseconds;
+    _kernelInvocations++;
+
+    // Log performance every 100 iterations for diagnostics
+    if(_kernelInvocations % 100 == 0) {
+        double avgKernelTime = _totalKernelTime / _kernelInvocations;
+        uint64_t keysPerSecond = (uint64_t)((numKeys / avgKernelTime) * 1000.0);
+        Logger::log(LogLevel::Info, "Kernel profiling: avg " +
+                    util::format("%.2f", avgKernelTime) + " ms/iteration, ~" +
+                    util::formatThousands(keysPerSecond) + " keys/sec (kernel only)");
     }
 
     getResultsInternal();
@@ -296,6 +331,57 @@ bool CudaKeySearchDevice::verifyKey(const secp256k1::uint256 &privateKey, const 
     }
 
     return true;
+}
+
+void CudaKeySearchDevice::calculateAndLogOccupancy()
+{
+    // Get device properties
+    cudaDeviceProp deviceProp;
+    cudaCall(cudaGetDeviceProperties(&deviceProp, _device));
+
+    // Log device information
+    Logger::log(LogLevel::Info, "GPU: " + std::string(deviceProp.name));
+    Logger::log(LogLevel::Info, "Compute Capability: " +
+                util::format(deviceProp.major) + "." + util::format(deviceProp.minor));
+    Logger::log(LogLevel::Info, "Multiprocessors: " + util::format(deviceProp.multiProcessorCount));
+    Logger::log(LogLevel::Info, "CUDA Cores: ~" +
+                util::formatThousands(deviceProp.multiProcessorCount * 128)); // Approximate
+
+    // Calculate thread configuration
+    uint64_t totalThreads = (uint64_t)_blocks * _threads;
+    uint64_t keysPerIteration = totalThreads * _pointsPerThread;
+
+    Logger::log(LogLevel::Info, "Blocks: " + util::format(_blocks));
+    Logger::log(LogLevel::Info, "Threads per block: " + util::format(_threads));
+    Logger::log(LogLevel::Info, "Points per thread: " + util::format(_pointsPerThread));
+    Logger::log(LogLevel::Info, "Total threads: " + util::formatThousands(totalThreads));
+    Logger::log(LogLevel::Info, "Keys per iteration: " + util::formatThousands(keysPerIteration));
+
+    // Calculate theoretical occupancy
+    // Note: cudaOccupancyMaxActiveBlocksPerMultiprocessor requires kernel function pointer
+    // For now, we'll calculate a simple metric
+    int maxThreadsPerSM = deviceProp.maxThreadsPerMultiProcessor;
+    int threadsPerBlock = _threads;
+    int maxBlocksPerSM = maxThreadsPerSM / threadsPerBlock;
+
+    // Estimate active threads vs maximum possible
+    int totalMaxThreads = deviceProp.multiProcessorCount * maxThreadsPerSM;
+    double occupancyPercent = (double)totalThreads / totalMaxThreads * 100.0;
+
+    Logger::log(LogLevel::Info, "Max threads per SM: " + util::format(maxThreadsPerSM));
+    Logger::log(LogLevel::Info, "Estimated occupancy: " + util::format("%.1f", occupancyPercent) + "%");
+
+    // Warn if occupancy is low
+    if(occupancyPercent < 50.0) {
+        Logger::log(LogLevel::Warning, "Low GPU occupancy detected! Consider increasing blocks/threads.");
+        Logger::log(LogLevel::Warning, "For RTX 4090, try: -b 128 -t 512 -p 128");
+    }
+
+    // Log memory configuration
+    Logger::log(LogLevel::Info, "Shared memory per block: " +
+                util::format((uint64_t)(deviceProp.sharedMemPerBlock / 1024)) + " KB");
+    Logger::log(LogLevel::Info, "L2 cache size: " +
+                util::format(deviceProp.l2CacheSize / (1024 * 1024)) + " MB");
 }
 
 size_t CudaKeySearchDevice::getResults(std::vector<KeySearchResult> &resultsOut)

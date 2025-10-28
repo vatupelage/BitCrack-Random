@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <math.h>
 #include <vector>
+#include <algorithm>
 
 #include "KeySearchDevice.h"
 
@@ -14,6 +15,7 @@
 #include "util.h"
 
 #define MAX_TARGETS_CONSTANT_MEM 16
+#define MAX_TARGETS_SORTED_MEM 1024  // Use sorted array + binary search for 17-1024 targets
 
 __constant__ unsigned int _TARGET_HASH[MAX_TARGETS_CONSTANT_MEM][5];
 __constant__ unsigned int _NUM_TARGET_HASHES[1];
@@ -21,7 +23,12 @@ __constant__ unsigned int *_BLOOM_FILTER[1];
 __constant__ unsigned int _BLOOM_FILTER_MASK[1];
 __constant__ unsigned long long _BLOOM_FILTER_MASK64[1];
 
-__constant__ unsigned int _USE_BLOOM_FILTER[1];
+// For sorted target mode (17-1024 targets)
+__constant__ unsigned int *_SORTED_TARGETS[1];
+__constant__ unsigned int _NUM_SORTED_TARGETS[1];
+
+// Lookup mode: 0=constant mem (≤16), 1=sorted+binary search (17-1024), 2=bloom32, 3=bloom64
+__constant__ unsigned int _LOOKUP_MODE[1];
 
 
 static unsigned int swp(unsigned int x)
@@ -68,14 +75,66 @@ cudaError_t CudaHashLookup::setTargetConstantMemory(const std::vector<struct has
 		return err;
 	}
 
-	unsigned int useBloomFilter = 0;
-
-	err = cudaMemcpyToSymbol(_USE_BLOOM_FILTER, &useBloomFilter, sizeof(bool));
+	// Mode 0: constant memory (≤16 targets)
+	unsigned int lookupMode = 0;
+	err = cudaMemcpyToSymbol(_LOOKUP_MODE, &lookupMode, sizeof(unsigned int));
 	if(err) {
 		return err;
 	}
 
+	Logger::log(LogLevel::Info, "Using constant memory for " + util::format((int)count) + " targets");
+
 	return cudaSuccess;
+}
+
+/**
+ * Sets L2 cache persistence for a memory region (CUDA 11.0+, Ampere/Ada GPUs)
+ * This pins frequently accessed data in the L2 cache for better performance
+ */
+cudaError_t CudaHashLookup::setL2CachePersistence(void *ptr, size_t bytes)
+{
+	// Check if GPU supports L2 cache persistence
+	int device;
+	cudaError_t err = cudaGetDevice(&device);
+	if(err != cudaSuccess) {
+		return err;
+	}
+
+	cudaDeviceProp deviceProp;
+	err = cudaGetDeviceProperties(&deviceProp, device);
+	if(err != cudaSuccess) {
+		return err;
+	}
+
+	// L2 persistence is supported on Ampere (8.x) and newer
+	if(deviceProp.major < 8) {
+		Logger::log(LogLevel::Info, "L2 cache persistence not available on compute capability < 8.0");
+		return cudaSuccess;  // Not an error, just not supported
+	}
+
+	// Create stream if not already created
+	if(_stream == NULL) {
+		err = cudaStreamCreate(&_stream);
+		if(err != cudaSuccess) {
+			return err;
+		}
+	}
+
+	// Set L2 cache persistence hint
+	cudaStreamAttrValue stream_attribute;
+	stream_attribute.accessPolicyWindow.base_ptr = ptr;
+	stream_attribute.accessPolicyWindow.num_bytes = bytes;
+	stream_attribute.accessPolicyWindow.hitRatio = 1.0f;  // Expect 100% hit ratio
+	stream_attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+	stream_attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+
+	err = cudaStreamSetAttribute(_stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+	if(err == cudaSuccess) {
+		Logger::log(LogLevel::Info, "L2 cache persistence enabled for " +
+		           util::format((uint64_t)(bytes / 1024)) + " KB");
+	}
+
+	return err;
 }
 
 /**
@@ -87,6 +146,97 @@ unsigned int CudaHashLookup::getOptimalBloomFilterBits(double p, size_t n)
 	double m = 3.6 * ceil((n * log(p)) / log(1 / pow(2, log(2))));
 
 	return (unsigned int)ceil(log(m) / log(2));
+}
+
+/**
+ * Comparison function for sorting hashes (for binary search)
+ * Compares hash160 structures lexicographically
+ */
+static bool compareHash160(const hash160 &a, const hash160 &b)
+{
+	for(int i = 0; i < 5; i++) {
+		if(a.h[i] < b.h[i]) return true;
+		if(a.h[i] > b.h[i]) return false;
+	}
+	return false;  // Equal
+}
+
+/**
+ * Sets up sorted target array for medium-sized target sets (17-1024 targets)
+ * Uses binary search on GPU for efficient lookup
+ */
+cudaError_t CudaHashLookup::setTargetSortedMemory(const std::vector<struct hash160> &targets)
+{
+	size_t count = targets.size();
+
+	Logger::log(LogLevel::Info, "Using sorted memory + binary search for " +
+	           util::format((int)count) + " targets (" +
+	           util::format((uint64_t)((count * 20) / 1024)) + " KB)");
+
+	// Sort targets for binary search
+	std::vector<hash160> sortedTargets = targets;
+	std::sort(sortedTargets.begin(), sortedTargets.end(), compareHash160);
+
+	// Undo RMD160 final round for GPU comparison
+	std::vector<unsigned int> deviceHashes(count * 5);
+	for(size_t i = 0; i < count; i++) {
+		unsigned int h[5];
+		undoRMD160FinalRound(sortedTargets[i].h, h);
+		for(int j = 0; j < 5; j++) {
+			deviceHashes[i * 5 + j] = h[j];
+		}
+	}
+
+	// Allocate GPU memory
+	size_t bytes = count * 5 * sizeof(unsigned int);
+	cudaError_t err = cudaMalloc(&_sortedTargetsPtr, bytes);
+	if(err) {
+		Logger::log(LogLevel::Error, "Device error: " + std::string(cudaGetErrorString(err)));
+		return err;
+	}
+
+	// Copy to device
+	err = cudaMemcpy(_sortedTargetsPtr, deviceHashes.data(), bytes, cudaMemcpyHostToDevice);
+	if(err) {
+		cudaFree(_sortedTargetsPtr);
+		_sortedTargetsPtr = NULL;
+		return err;
+	}
+
+	// Set L2 cache persistence for sorted targets (RTX 4090 has 72MB L2)
+	err = setL2CachePersistence(_sortedTargetsPtr, bytes);
+	if(err != cudaSuccess) {
+		Logger::log(LogLevel::Warning, "Could not set L2 persistence: " +
+		           std::string(cudaGetErrorString(err)));
+		// Continue anyway, this is just an optimization
+	}
+
+	// Copy pointer to constant memory
+	err = cudaMemcpyToSymbol(_SORTED_TARGETS, &_sortedTargetsPtr, sizeof(unsigned int *));
+	if(err) {
+		cudaFree(_sortedTargetsPtr);
+		_sortedTargetsPtr = NULL;
+		return err;
+	}
+
+	// Set count
+	err = cudaMemcpyToSymbol(_NUM_SORTED_TARGETS, &count, sizeof(unsigned int));
+	if(err) {
+		cudaFree(_sortedTargetsPtr);
+		_sortedTargetsPtr = NULL;
+		return err;
+	}
+
+	// Mode 1: sorted array + binary search
+	unsigned int lookupMode = 1;
+	err = cudaMemcpyToSymbol(_LOOKUP_MODE, &lookupMode, sizeof(unsigned int));
+	if(err) {
+		cudaFree(_sortedTargetsPtr);
+		_sortedTargetsPtr = NULL;
+		return err;
+	}
+
+	return cudaSuccess;
 }
 
 void CudaHashLookup::initializeBloomFilter(const std::vector<struct hash160> &targets, unsigned int *filter, unsigned int mask)
@@ -177,6 +327,14 @@ cudaError_t CudaHashLookup::setTargetBloomFilter(const std::vector<struct hash16
 		return err;
 	}
 
+	// Set L2 cache persistence for Bloom filter (RTX 4090 has 72MB L2)
+	err = setL2CachePersistence(_bloomFilterPtr, bloomFilterBytes);
+	if(err != cudaSuccess) {
+		Logger::log(LogLevel::Warning, "Could not set L2 persistence for Bloom filter: " +
+		           std::string(cudaGetErrorString(err)));
+		// Continue anyway, this is just an optimization
+	}
+
 	// Copy device memory pointer to constant memory
 	err = cudaMemcpyToSymbol(_BLOOM_FILTER, &_bloomFilterPtr, sizeof(unsigned int *));
 	if(err) {
@@ -205,26 +363,40 @@ cudaError_t CudaHashLookup::setTargetBloomFilter(const std::vector<struct hash16
 		}
 	}
 
-	unsigned int useBloomFilter = bloomFilterBits <= 32 ? 1 : 2;
-
-	err = cudaMemcpyToSymbol(_USE_BLOOM_FILTER, &useBloomFilter, sizeof(unsigned int));
+	// Mode 2: bloom filter (32-bit), Mode 3: bloom filter (64-bit)
+	unsigned int lookupMode = bloomFilterBits <= 32 ? 2 : 3;
+	err = cudaMemcpyToSymbol(_LOOKUP_MODE, &lookupMode, sizeof(unsigned int));
 
 	delete[] filter;
+
+	if(err == cudaSuccess) {
+		Logger::log(LogLevel::Info, "Bloom filter mode " +
+		           util::format(lookupMode) + " initialized");
+	}
 
 	return err;
 }
 
 /**
-*Copies the target hashes to either constant memory, or the bloom filter depending
-on how many targets there are
-*/
+ * Copies the target hashes to the most efficient storage based on target count:
+ * - ≤16 targets: Constant memory (fastest, but limited size)
+ * - 17-1024 targets: Sorted array with binary search + L2 cache pinning
+ * - >1024 targets: Bloom filter + L2 cache pinning
+ */
 cudaError_t CudaHashLookup::setTargets(const std::vector<struct hash160> &targets)
 {
 	cleanup();
 
-	if(targets.size() <= MAX_TARGETS_CONSTANT_MEM) {
+	size_t count = targets.size();
+
+	if(count <= MAX_TARGETS_CONSTANT_MEM) {
+		// Small sets: use constant memory (legacy, fastest for ≤16 targets)
 		return setTargetConstantMemory(targets);
+	} else if(count <= MAX_TARGETS_SORTED_MEM) {
+		// Medium sets: use sorted array + binary search with L2 persistence
+		return setTargetSortedMemory(targets);
 	} else {
+		// Large sets: use Bloom filter with L2 persistence
 		return setTargetBloomFilter(targets);
 	}
 }
@@ -235,6 +407,57 @@ void CudaHashLookup::cleanup()
 		cudaFree(_bloomFilterPtr);
 		_bloomFilterPtr = NULL;
 	}
+
+	if(_sortedTargetsPtr != NULL) {
+		cudaFree(_sortedTargetsPtr);
+		_sortedTargetsPtr = NULL;
+	}
+
+	if(_stream != NULL) {
+		cudaStreamDestroy(_stream);
+		_stream = NULL;
+	}
+}
+
+/**
+ * Device-side binary search for sorted targets
+ * Uses L2-cached sorted array for O(log n) lookup
+ */
+__device__ bool checkSortedTargets(const unsigned int hash[5])
+{
+	unsigned int count = *_NUM_SORTED_TARGETS;
+	unsigned int *targets = _SORTED_TARGETS[0];
+
+	int left = 0;
+	int right = count - 1;
+
+	while(left <= right) {
+		int mid = (left + right) / 2;
+		unsigned int *midHash = &targets[mid * 5];
+
+		// Compare lexicographically
+		int cmp = 0;
+		for(int i = 0; i < 5; i++) {
+			if(hash[i] < midHash[i]) {
+				cmp = -1;
+				break;
+			}
+			if(hash[i] > midHash[i]) {
+				cmp = 1;
+				break;
+			}
+		}
+
+		if(cmp == 0) {
+			return true;  // Found exact match
+		} else if(cmp < 0) {
+			right = mid - 1;
+		} else {
+			left = mid + 1;
+		}
+	}
+
+	return false;  // Not found
 }
 
 __device__ bool checkBloomFilter(const unsigned int hash[5])
@@ -283,24 +506,44 @@ __device__ bool checkBloomFilter64(const unsigned int hash[5])
 }
 
 
+/**
+ * Main hash checking function - routes to appropriate lookup method
+ * Mode 0: Constant memory linear search (≤16 targets)
+ * Mode 1: Sorted array + binary search (17-1024 targets)
+ * Mode 2: Bloom filter 32-bit (>1024 targets, small keyspace)
+ * Mode 3: Bloom filter 64-bit (>1024 targets, large keyspace)
+ */
 __device__ bool checkHash(const unsigned int hash[5])
 {
-	bool foundMatch = false;
+	unsigned int mode = *_LOOKUP_MODE;
 
-	if(*_USE_BLOOM_FILTER == 1) {
-		return checkBloomFilter(hash);
-	} else if(*_USE_BLOOM_FILTER == 2) {
-		return checkBloomFilter64(hash);
-	} else {
-		for(int j = 0; j < *_NUM_TARGET_HASHES; j++) {
-			bool equal = true;
-			for(int i = 0; i < 5; i++) {
-				equal &= (hash[i] == _TARGET_HASH[j][i]);
+	switch(mode) {
+		case 0: {
+			// Constant memory - linear search (fastest for ≤16 targets)
+			bool foundMatch = false;
+			for(int j = 0; j < *_NUM_TARGET_HASHES; j++) {
+				bool equal = true;
+				for(int i = 0; i < 5; i++) {
+					equal &= (hash[i] == _TARGET_HASH[j][i]);
+				}
+				foundMatch |= equal;
 			}
-
-			foundMatch |= equal;
+			return foundMatch;
 		}
-	}
 
-	return foundMatch;
+		case 1:
+			// Sorted array - binary search with L2 cache persistence
+			return checkSortedTargets(hash);
+
+		case 2:
+			// Bloom filter 32-bit
+			return checkBloomFilter(hash);
+
+		case 3:
+			// Bloom filter 64-bit
+			return checkBloomFilter64(hash);
+
+		default:
+			return false;
+	}
 }

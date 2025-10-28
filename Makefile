@@ -10,12 +10,27 @@ LIBS+=-L$(LIBDIR)
 
 # C++ options
 CXX=g++
-CXXFLAGS=-O2 -std=c++11
+CXXFLAGS=-O3 -std=c++17
 
 # CUDA variables
-COMPUTE_CAP=30
+# Default to RTX 4090 (Compute 8.9, Ada Lovelace). Override with COMPUTE_CAP=XX for other GPUs
+# Common values: 8.9 (RTX 4090), 8.6 (RTX 3090), 7.5 (RTX 2080), 6.1 (GTX 1080)
+COMPUTE_CAP=89
 NVCC=nvcc
-NVCCFLAGS=-std=c++11 -gencode=arch=compute_${COMPUTE_CAP},code=\"sm_${COMPUTE_CAP}\" -Xptxas="-v" -Xcompiler "${CXXFLAGS}"
+
+# Phase 3: Enable PTX optimizations for modern GPUs (Turing 7.5+)
+# LOP3 and funnel shifts available on Compute 7.5+
+NVCC_PHASE3_FLAGS=-DUSE_FAST_MATH_PTX
+
+NVCCFLAGS=-std=c++17 \
+	-gencode=arch=compute_${COMPUTE_CAP},code=\"sm_${COMPUTE_CAP},compute_${COMPUTE_CAP}\" \
+	--use_fast_math \
+	-O3 \
+	--ptxas-options=-v \
+	--ptxas-options=--warn-on-spills \
+	-lineinfo \
+	${NVCC_PHASE3_FLAGS} \
+	-Xcompiler "${CXXFLAGS}"
 CUDA_HOME=/usr/local/cuda
 CUDA_LIB=${CUDA_HOME}/lib64
 CUDA_INCLUDE=${CUDA_HOME}/include
