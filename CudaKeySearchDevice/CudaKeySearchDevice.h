@@ -94,6 +94,9 @@ public:
     virtual void getMemoryInfo(uint64_t &freeMem, uint64_t &totalMem);
 
     virtual secp256k1::uint256 getNextKey();
+
+    // Random scan support: update starting point without full reinitialization
+    void setStartingKey(const secp256k1::uint256 &start);
 };
 
 #endif

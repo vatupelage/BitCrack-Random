@@ -76,6 +76,9 @@ static std::mutex _resultMutex;
 static std::mutex _statusMutex;
 static std::mutex _checkpointMutex;
 
+// Random scan global state
+static KeyFinder* _keyFinderInstance = nullptr;
+
 /**
 * Callback to display the private key (thread-safe for multi-GPU)
 */
@@ -374,6 +377,12 @@ void writeCheckpoint(secp256k1::uint256 nextKey)
 {
     std::lock_guard<std::mutex> lock(_checkpointMutex);
 
+    // Save random scan state if enabled
+    if (_keyFinderInstance && _keyFinderInstance->isRandomMode()) {
+        std::string randomStateFile = _config.checkpointFile + ".random";
+        _keyFinderInstance->saveRandomState(randomStateFile);
+    }
+
     std::ofstream tmp(_config.checkpointFile, std::ios::out);
 
     tmp << "start=" << _config.startKey.toString() << std::endl;
@@ -593,11 +602,20 @@ int run()
 
         KeyFinder f(_config.nextKey, _config.endKey, _config.compression, d, _config.stride);
 
+        // Set global pointer for checkpoint saving
+        _keyFinderInstance = &f;
+
         f.setResultCallback(resultCallback);
         f.setStatusInterval(_config.statusInterval);
         f.setStatusCallback(statusCallback);
 
         f.init();
+
+        // Load random scan state if checkpoint exists
+        if (_config.checkpointFile.length() > 0 && f.isRandomMode()) {
+            std::string randomStateFile = _config.checkpointFile + ".random";
+            f.loadRandomState(randomStateFile);
+        }
 
         if(!_config.targetsFile.empty()) {
             f.setTargets(_config.targetsFile);
@@ -606,6 +624,9 @@ int run()
         }
 
         f.run();
+
+        // Clear global pointer
+        _keyFinderInstance = nullptr;
 
         delete d;
     } catch(KeySearchException ex) {

@@ -400,3 +400,12 @@ secp256k1::uint256 CudaKeySearchDevice::getNextKey()
 
     return _startExponent + secp256k1::uint256(totalPoints) * _iterations * _stride;
 }
+
+void CudaKeySearchDevice::setStartingKey(const secp256k1::uint256 &start)
+{
+    _startExponent = start;
+    _iterations = 0;
+
+    // Regenerate starting points for new key
+    generateStartingPoints();
+}
