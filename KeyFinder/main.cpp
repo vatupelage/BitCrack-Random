@@ -59,6 +59,7 @@ typedef struct {
     secp256k1::uint256 stride = 1;
 
     bool follow = false;
+    bool shuffleIndex = false;  // Phase 2: Shuffle-Index mode
 }RunConfig;
 
 static RunConfig _config;
@@ -611,6 +612,23 @@ int run()
 
         f.init();
 
+        // Enable shuffle-index mode if requested (Phase 2 optimization)
+        // Must be done AFTER f.init() which enables reservoir mode in random scan
+        #ifdef BUILD_CUDA
+        if (_config.shuffleIndex) {
+            CudaKeySearchDevice* cudaDevice = dynamic_cast<CudaKeySearchDevice*>(d);
+            if (cudaDevice) {
+                if (cudaDevice->isReservoirMode()) {
+                    cudaDevice->setShuffleIndexMode(true);
+                } else {
+                    Logger::log(LogLevel::Warning, "--shuffle-index requires random scan mode, ignoring");
+                }
+            } else {
+                Logger::log(LogLevel::Warning, "--shuffle-index only works with CUDA devices, ignoring");
+            }
+        }
+        #endif
+
         // Load random scan state if checkpoint exists
         if (_config.checkpointFile.length() > 0 && f.isRandomMode()) {
             std::string randomStateFile = _config.checkpointFile + ".random";
@@ -731,6 +749,7 @@ int main(int argc, char **argv)
     parser.add("", "--continue", true);
     parser.add("", "--share", true);
     parser.add("", "--stride", true);
+    parser.add("", "--shuffle-index", false);  // Phase 2: Shuffle-Index mode
 
     try {
         parser.parse(argc, argv);
@@ -829,6 +848,8 @@ int main(int argc, char **argv)
                 }
             } else if(optArg.equals("-f", "--follow")) {
                 _config.follow = true;
+            } else if(optArg.equals("", "--shuffle-index")) {
+                _config.shuffleIndex = true;
             }
 
 		} catch(std::string err) {

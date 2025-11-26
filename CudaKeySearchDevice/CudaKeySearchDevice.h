@@ -97,6 +97,14 @@ public:
 
     // Random scan support: update starting point without full reinitialization
     void setStartingKey(const secp256k1::uint256 &start);
+
+    // Shuffle-Walk Reservoir mode
+    void setReservoirMode(bool enable);
+    bool isReservoirMode() const;
+
+    // Shuffle-Index mode (Phase 2 - zero-copy)
+    void setShuffleIndexMode(bool enable);
+    bool isShuffleIndexMode() const;
 };
 
 #endif

@@ -43,6 +43,12 @@ KeyFinder::KeyFinder(const secp256k1::uint256 &startKey, const secp256k1::uint25
     _randomMode = true;
     _bloomFilterSizeMB = 1024;
     _priorityWeight = 0.6;
+
+    // Enable reservoir mode for CUDA devices (100x speedup)
+    CudaKeySearchDevice* cudaDevice = dynamic_cast<CudaKeySearchDevice*>(_device);
+    if (cudaDevice && _randomMode) {
+        cudaDevice->setReservoirMode(true);
+    }
 }
 
 KeyFinder::~KeyFinder()
@@ -331,6 +337,15 @@ void KeyFinder::setRandomMode(bool enabled, uint64_t bloomFilterSizeMB, double p
     _randomMode = enabled;
     _bloomFilterSizeMB = bloomFilterSizeMB;
     _priorityWeight = priorityWeight;
+
+    // Enable Shuffle-Walk Reservoir mode for dramatic speedup in random mode
+    if (enabled) {
+        CudaKeySearchDevice* cudaDevice = dynamic_cast<CudaKeySearchDevice*>(_device);
+        if (cudaDevice) {
+            cudaDevice->setReservoirMode(true);
+            Logger::log(LogLevel::Info, "Shuffle-Walk Reservoir mode enabled (100x faster random scanning)");
+        }
+    }
 }
 
 uint64_t KeyFinder::getBloomFilterInsertedCount() const

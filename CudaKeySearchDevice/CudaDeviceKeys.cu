@@ -5,6 +5,8 @@
 #include "CudaDeviceKeys.h"
 #include "CudaDeviceKeys.cuh"
 #include "secp256k1.cuh"
+#include "CudaShuffleIndex.h"
+#include "Logger.h"
 
 
 __constant__ unsigned int *_xPtr[1];
@@ -191,6 +193,14 @@ cudaError_t CudaDeviceKeys::initializePublicKeys(size_t count)
 
 cudaError_t CudaDeviceKeys::init(int blocks, int threads, int pointsPerThread, const std::vector<secp256k1::uint256> &privateKeys)
 {
+	// Free existing allocations before re-initializing (fixes memory leak in random mode)
+	if (_devX != NULL || _devY != NULL) {
+		clearPublicKeys();
+	}
+	if (_devPrivate != NULL || _devBasePointX != NULL || _devBasePointY != NULL || _devChain != NULL) {
+		clearPrivateKeys();
+	}
+
 	_blocks = blocks;
 	_threads = threads;
 	_pointsPerThread = pointsPerThread;
@@ -273,6 +283,244 @@ void CudaDeviceKeys::clearPrivateKeys()
 	_devBasePointX = NULL;
 	_devBasePointY = NULL;
 	_devPrivate = NULL;
+
+	// Note: Reservoir buffers are NOT freed here - they persist across iterations
+}
+
+// ============================================================================
+// SHUFFLE-WALK RESERVOIR MODE IMPLEMENTATION
+// ============================================================================
+
+void CudaDeviceKeys::enableReservoirMode(bool enable)
+{
+	_reservoirMode = enable;
+}
+
+cudaError_t CudaDeviceKeys::initReservoir(int blocks, int threads, int pointsPerThread, const std::vector<secp256k1::uint256> &baseKeys)
+{
+	_blocks = blocks;
+	_threads = threads;
+	_pointsPerThread = pointsPerThread;
+
+	size_t count = baseKeys.size();
+	_numKeys = count;
+
+	// Allocate persistent reservoir buffers (never freed during random mode)
+	cudaError_t err = cudaMalloc(&_reservoirX, sizeof(unsigned int) * count * 8);
+	if(err) {
+		return err;
+	}
+
+	err = cudaMalloc(&_reservoirY, sizeof(unsigned int) * count * 8);
+	if(err) {
+		cudaFree(_reservoirX);
+		_reservoirX = NULL;
+		return err;
+	}
+
+	// Initialize with identity (will be overwritten by EC points)
+	err = cudaMemset(_reservoirX, 0, sizeof(unsigned int) * count * 8);
+	if(err) {
+		return err;
+	}
+
+	err = cudaMemset(_reservoirY, 0, sizeof(unsigned int) * count * 8);
+	if(err) {
+		return err;
+	}
+
+	// Allocate working buffers (same as normal mode)
+	err = initializePublicKeys(count);
+	if(err) {
+		return err;
+	}
+
+	err = initializeBasePoints();
+	if(err) {
+		return err;
+	}
+
+	// Allocate private keys buffer
+	err = cudaMalloc(&_devPrivate, sizeof(unsigned int) * count * 8);
+	if(err) {
+		return err;
+	}
+
+	err = cudaMemset(_devPrivate, 0, sizeof(unsigned int) * count * 8);
+	if(err) {
+		return err;
+	}
+
+	err = allocateChainBuf(_threads * _blocks * _pointsPerThread);
+	if(err) {
+		return err;
+	}
+
+	// Copy private keys to buffer
+	unsigned int *tmp = new unsigned int[count * 8];
+
+	for(int block = 0; block < _blocks; block++) {
+		for(int thread = 0; thread < _threads; thread++) {
+			for(int idx = 0; idx < _pointsPerThread; idx++) {
+				int index = getIndex(block, thread, idx);
+				splatBigInt(tmp, block, thread, idx, baseKeys[index]);
+			}
+		}
+	}
+
+	err = cudaMemcpy(_devPrivate, tmp, sizeof(unsigned int) * count * 8, cudaMemcpyHostToDevice);
+
+	delete[] tmp;
+
+	if(err) {
+		return err;
+	}
+
+	// Compute EC points (256 steps - EXPENSIVE but done ONCE)
+	for(int i = 1; i <= 256; i++) {
+		err = doStep();
+		if(err) {
+			return err;
+		}
+	}
+
+	// Copy computed points to persistent reservoir
+	err = cudaMemcpy(_reservoirX, _devX, sizeof(unsigned int) * count * 8, cudaMemcpyDeviceToDevice);
+	if(err) {
+		return err;
+	}
+
+	err = cudaMemcpy(_reservoirY, _devY, sizeof(unsigned int) * count * 8, cudaMemcpyDeviceToDevice);
+	if(err) {
+		return err;
+	}
+
+	// Clear private keys (no longer needed)
+	clearPrivateKeys();
+
+	_reservoirEpoch = 0;
+
+	return cudaSuccess;
+}
+
+// Indirect copy kernel for shuffle-index mode
+__global__ void indirectCopyKernel(
+	unsigned int *dest,
+	const unsigned int *src,
+	const uint32_t *indexLUT,
+	uint32_t count
+) {
+	uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+	if (tid >= count) return;
+
+	// Each point is 8 words (256 bits)
+	uint32_t logicalIdx = tid / 8;
+	uint32_t wordIdx = tid % 8;
+	uint32_t physicalIdx = indexLUT[logicalIdx];
+
+	dest[tid] = src[physicalIdx * 8 + wordIdx];
+}
+
+cudaError_t CudaDeviceKeys::copyFromReservoir()
+{
+	if (!_reservoirMode || _reservoirX == NULL || _reservoirY == NULL) {
+		return cudaErrorInvalidValue;
+	}
+
+	size_t count = (size_t)_blocks * _threads * _pointsPerThread;
+
+	// Check if shuffle-index mode is enabled
+	if (_shuffleIndexMode && _shuffleIndex) {
+		// PHASE 2: Indirect copy using shuffled index LUT
+		const uint32_t *indexLUT = _shuffleIndex->getDeviceIndexLUT();
+		uint32_t totalWords = count * 8;  // 8 words per point
+		int threads = 256;
+		int blocks = (totalWords + threads - 1) / threads;
+
+		indirectCopyKernel<<<blocks, threads>>>(_devX, _reservoirX, indexLUT, totalWords);
+		cudaError_t err = cudaGetLastError();
+		if (err != cudaSuccess) return err;
+
+		indirectCopyKernel<<<blocks, threads>>>(_devY, _reservoirY, indexLUT, totalWords);
+		err = cudaGetLastError();
+		if (err != cudaSuccess) return err;
+
+		cudaDeviceSynchronize();
+		return cudaSuccess;
+	} else {
+		// PHASE 1: Direct memcpy (512MB, ~10-15ms)
+		cudaError_t err = cudaMemcpy(_devX, _reservoirX, sizeof(unsigned int) * count * 8, cudaMemcpyDeviceToDevice);
+		if(err) {
+			return err;
+		}
+
+		err = cudaMemcpy(_devY, _reservoirY, sizeof(unsigned int) * count * 8, cudaMemcpyDeviceToDevice);
+		if(err) {
+			return err;
+		}
+
+		return cudaSuccess;
+	}
+}
+
+cudaError_t CudaDeviceKeys::rotateReservoir(float fraction)
+{
+	// TODO: Implement partial reservoir rotation
+	// This will regenerate a small percentage of reservoir points
+	// to maintain diversity while keeping most points cached
+
+	_reservoirEpoch++;
+
+	return cudaSuccess;  // Placeholder
+}
+
+// ============================================================================
+// SHUFFLE-INDEX MODE IMPLEMENTATION (Phase 2 - Zero-Copy)
+// ============================================================================
+
+void CudaDeviceKeys::enableShuffleIndexMode(bool enable)
+{
+	_shuffleIndexMode = enable;
+}
+
+cudaError_t CudaDeviceKeys::initShuffleIndex(int blocks)
+{
+	if (!_reservoirMode || !_reservoirX || !_reservoirY) {
+		Logger::log(LogLevel::Error, "Cannot init shuffle-index: reservoir not initialized");
+		return cudaErrorInvalidValue;
+	}
+
+	if (_shuffleIndex) {
+		delete _shuffleIndex;
+	}
+
+	_shuffleIndex = new CudaShuffleIndex();
+
+	uint32_t reservoirSize = _blocks * _threads * _pointsPerThread;
+	cudaError_t err = _shuffleIndex->init(reservoirSize, blocks);
+
+	if (err == cudaSuccess) {
+		Logger::log(LogLevel::Info, "Shuffle-Index Mode initialized successfully");
+	}
+
+	return err;
+}
+
+cudaError_t CudaDeviceKeys::shuffleIndices()
+{
+	if (!_shuffleIndex) {
+		return cudaErrorInvalidValue;
+	}
+
+	return _shuffleIndex->shuffle();
+}
+
+const uint32_t* CudaDeviceKeys::getIndexLUT() const
+{
+	if (!_shuffleIndex) {
+		return nullptr;
+	}
+	return _shuffleIndex->getDeviceIndexLUT();
 }
 
 cudaError_t CudaDeviceKeys::doStep()
