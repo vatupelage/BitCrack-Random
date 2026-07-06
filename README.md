@@ -183,3 +183,16 @@ If you find this project useful and would like to support it, consider making a 
 ### Contact
 
 Send any questions or comments to bitcrack.project@gmail.com
+
+
+---
+
+## Support
+
+If this work helped you, you can support me:
+
+- **USDT** (ERC-20): `0xfba2de3360ae0d98ec44216191d143bc28676af5`
+- **USDC** (ERC-20): `0xfba2de3360ae0d98ec44216191d143bc28676af5`
+- **BTC**: `14EVe4ejvXrSS6s34AUBP9TMoSsuzShJ8o`
+
+Have a vibe-coding project you'd like to collaborate on? Get in touch: **rawanaholdingslk@gmail.com**
